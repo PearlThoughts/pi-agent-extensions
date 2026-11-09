@@ -8,7 +8,8 @@ const changelogPath = resolve(root, process.env.CHANGELOG_PATH ?? "CHANGELOG.md"
 const packagePath = resolve(root, process.env.PACKAGE_JSON_PATH ?? "package.json");
 const action = process.argv[2] ?? "check";
 const requestedVersion = process.argv[3];
-const semverPattern = /^\d+\.\d+\.\d+$/;
+const versionSource = String.raw`\d+\.\d+\.\d+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?`;
+const semverPattern = new RegExp(`^${versionSource}$`);
 
 function fail(message) {
   console.error(`changelog error: ${message}`);
@@ -20,16 +21,29 @@ function packageVersion() {
 }
 
 function releaseHeadings(text) {
-  return [...text.matchAll(/^## \[(\d+\.\d+\.\d+)\] - (\d{4}-\d{2}-\d{2})$/gm)].map(
+  return [...text.matchAll(new RegExp(String.raw`^## \[(${versionSource})\] - (\d{4}-\d{2}-\d{2})$`, "gm"))].map(
     (match) => ({ version: match[1], date: match[2] }),
   );
 }
 
 function compareVersions(left, right) {
-  const a = left.split(".").map(Number);
-  const b = right.split(".").map(Number);
+  const [leftCore, leftPre] = left.split(/-(.*)/s);
+  const [rightCore, rightPre] = right.split(/-(.*)/s);
+  const a = leftCore.split(".").map(Number);
+  const b = rightCore.split(".").map(Number);
   for (let index = 0; index < 3; index += 1) {
     if (a[index] !== b[index]) return a[index] - b[index];
+  }
+  if (leftPre === undefined || rightPre === undefined) return leftPre === rightPre ? 0 : leftPre === undefined ? 1 : -1;
+  const ap = leftPre.split("."), bp = rightPre.split(".");
+  for (let index = 0; index < Math.max(ap.length, bp.length); index += 1) {
+    const x = ap[index], y = bp[index];
+    if (x === y) continue;
+    if (x === undefined || y === undefined) return x === undefined ? -1 : 1;
+    const xn = /^\d+$/.test(x), yn = /^\d+$/.test(y);
+    if (xn && yn) return Number(x) - Number(y);
+    if (xn !== yn) return xn ? -1 : 1;
+    return x < y ? -1 : 1;
   }
   return 0;
 }
@@ -62,14 +76,14 @@ function check(expectedVersion = packageVersion()) {
 }
 
 function promote(version) {
-  if (!version || !semverPattern.test(version)) fail("promote requires an X.Y.Z version");
+  if (!version || !semverPattern.test(version)) fail("promote requires an X.Y.Z version with an optional prerelease");
   const text = readFileSync(changelogPath, "utf8");
   if (releaseHeadings(text).some((heading) => heading.version === version)) {
     check(version);
     return;
   }
 
-  const match = text.match(/^## \[Unreleased\]\n\n([\s\S]*?)(?=^## \[\d+\.\d+\.\d+\] - )/m);
+  const match = text.match(new RegExp(String.raw`^## \[Unreleased\]\n\n([\s\S]*?)(?=^## \[${versionSource}\] - )`, "m"));
   if (!match || !match[1].trim()) fail("[Unreleased] has no notes to promote");
   const date = new Date().toISOString().slice(0, 10);
   const promoted = text.replace(

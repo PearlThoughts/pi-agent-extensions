@@ -2,7 +2,43 @@
 
 `/workflow` is an opinionated dynamic-workflow control plane for Pi. It turns a decomposable request into an inspectable JavaScript program, routes subagents by semantic role, asks for approval, and runs the work in the background.
 
-Requires Pi 0.80.10 or newer.
+Requires Pi 0.80.10 or newer. The maintained **0.5.6-pt.1** child-capture build is validated with **Pi 1.5.0** and **pi-monitor 0.10.0**.
+
+## Maintained child-capture compatibility build
+
+This build is based on upstream commit `8a8ec30fff0341a1fc3159eaf367351c421f4b5d`; its original workflow sources match npm `pi-agent-extensions@0.5.6`. It keeps the original workflow extension and adds an optional SDK observer before each child prompt. The default entry discovers pi-monitor through `pi-monitor:workflow-observer:v1`; the bus exchanges only a version and callback registration. The actual SDK session goes directly to that callback. With no observer, workflow operation stays unchanged. Programmatic integrations may pass a typed `childObserver` to `createWorkflowExtension` or `WorkflowManager`; types live in `child-observer.ts`.
+
+Children use actual SDK IDs and the original launching run's parent ID, captured before approval. A parent session change does not reparent background output. Each retry has its own SDK session; cached resume steps create no session or new captured usage. Resuming under a different caller keeps the run's original parent. Observer startup failure prevents that child prompt and follows the existing failed-agent/retry result handling. Observer teardown drains before child disposal, bounded to two seconds; asynchronous drain failure preserves inference results. The monitor independently limits its drain to 1.5 seconds and admits only company-provider records with request-bound served-account metadata.
+
+Replace the original `pi-agent-extensions` package with this pinned compatibility build. Load exactly one workflow entry; installing both packages would register duplicate tools. For an unpublished local artifact:
+
+```sh
+npm ci
+npm run test:workflow
+npm run typecheck:workflow
+npm test
+npm pack --dry-run
+npm pack
+# On the producing host, extract the reviewed artifact into a dedicated directory:
+mkdir -p "$HOME/.local/share/pi-workflow-0.5.6-pt.1"
+tar -xzf pi-agent-extensions-0.5.6-pt.1.tgz -C "$HOME/.local/share/pi-workflow-0.5.6-pt.1"
+# Remove the existing source as shown by pi list, then install the replacement:
+pi remove npm:pi-agent-extensions
+pi install "$HOME/.local/share/pi-workflow-0.5.6-pt.1/package"
+```
+
+Install the reviewed monitor 0.10.0 artifact on the same producing hosts and restart Pi. Existing running workflows cannot gain observers retroactively. This producer adds no browser completion/waiting state. Upstream MIT licensing and author attribution remain in the package.
+
+The opt-in installed-SDK regression uses only scratch configuration, synthetic auth/providers, and localhost inference/upload services:
+
+```sh
+# PI_PKG must identify the package owned by the installed Pi launcher.
+PI_COMPAT=1 PI_PKG="$pi_pkg" PI_MONITOR_SOURCE="$monitor_source" \
+  node --import tsx --test tests/workflow/sdk-integration.test.ts
+```
+
+The fixture prints its scratch directory and retains `captured-records.json` and `workflow-evidence.json` for independent Worker hierarchy checks. It covers the managed workflow tool, company/private siblings, concurrent old/new parents, late background output, retry sessions, cached resume, original ancestry on invocation resume, and incompatible observer rejection. Normal tests also cover cancellation during attachment, pre-cancelled invocation, model/thinking/tool preservation, `noExtensions`, and bounded cleanup. No historical transcript is replayed.
+
 
 ## First run
 

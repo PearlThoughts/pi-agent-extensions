@@ -7,6 +7,7 @@ import {
 import {
   buildForcedWorkflowPrompt,
   createWorkflowTool,
+  invocationSessionId,
   saveModelTierConfig,
   WorkflowManager,
   type WorkflowToolInput,
@@ -43,6 +44,7 @@ import { requestWorkflowApproval } from "./approval.js";
 import { formatWorkflowDoctor, formatWorkflowHelp } from "./help.js";
 import { openWorkflowRunBrowser } from "./run-browser.js";
 import { installWorkflowResultDelivery, installWorkflowTaskPanel } from "./ui.js";
+import { discoverChildObserver, type AttachChild } from "./child-observer.js";
 
 const USAGE = [
   "Usage:",
@@ -71,6 +73,7 @@ const PROFILE_LABELS: Record<WorkflowProfileName, string> = {
 export interface WorkflowExtensionOptions {
   cwd?: string;
   runsDir?: string;
+  childObserver?: AttachChild;
 }
 
 export function createWorkflowExtension(options: WorkflowExtensionOptions = {}): (pi: ExtensionAPI) => void {
@@ -79,10 +82,26 @@ export function createWorkflowExtension(options: WorkflowExtensionOptions = {}):
     const manager = new WorkflowManager({
       cwd,
       runsDir: options.runsDir,
+      childObserver: options.childObserver ?? (async (session, origin) => {
+        const observer = discoverChildObserver(pi.events);
+        return observer ? observer(session, origin) : { async dispose() {} };
+      }),
       loadSavedWorkflow: (name) => loadWorkflowFile(cwd, name)?.script,
     });
-    const workflowTool = createWorkflowTool({ cwd, manager });
-    const upstreamExecute = workflowTool.execute.bind(workflowTool);
+    const workflowTool = createWorkflowTool({
+      cwd,
+      manager,
+      beforeExecute: async (input, ctx) => {
+        const settings = requireConfiguredSettings(cwd);
+        requireTrustedProject(ctx);
+        assertConfiguredModels(settings, toModelCandidates(ctx.modelRegistry.getAvailable()));
+        saveModelTierConfig(toModelTierConfig(settings));
+        const limited = applyWorkflowLimits(input, settings);
+        const preview = createWorkflowPreview(limited.script, settings, "generated", limited);
+        await requireWorkflowApproval(ctx, preview, true);
+        return limited;
+      },
+    });
     const upstreamGuidelines = [...(workflowTool.promptGuidelines ?? [])];
 
     Object.defineProperty(workflowTool, "promptGuidelines", {
@@ -95,18 +114,6 @@ export function createWorkflowExtension(options: WorkflowExtensionOptions = {}):
           : [...upstreamGuidelines, "Workflow model roles are not configured. Ask the user to run /workflow setup first."];
       },
     });
-
-    workflowTool.execute = async (toolCallId, input, signal, onUpdate, ctx) => {
-      const settings = requireConfiguredSettings(cwd);
-      requireTrustedProject(ctx);
-      assertConfiguredModels(settings, toModelCandidates(ctx.modelRegistry.getAvailable()));
-      saveModelTierConfig(toModelTierConfig(settings));
-
-      const limited = applyWorkflowLimits(input as WorkflowToolInput, settings);
-      const preview = createWorkflowPreview(limited.script, settings, "generated", limited);
-      await requireWorkflowApproval(ctx, preview, true);
-      return upstreamExecute(toolCallId, limited, signal, onUpdate, ctx);
-    };
 
     pi.registerTool(workflowTool);
     registerWorkflowCommand(pi, manager, cwd, workflowTool.name);
@@ -284,6 +291,7 @@ async function runSavedWorkflow(
   rawArgs: string,
   ctx: ExtensionCommandContext,
 ): Promise<void> {
+  const parentSessionId = invocationSessionId(ctx);
   if (!name) return ctx.ui.notify("Usage: /workflow saved <name> [json args]", "warning");
   requireTrustedProject(ctx);
   const settings = requireConfiguredSettings(cwd);
@@ -304,6 +312,7 @@ async function runSavedWorkflow(
   const preview = createWorkflowPreview(workflow.script, settings, "saved");
   await requireWorkflowApproval(ctx, preview, settings.approvalMode === "always");
   const { runId, promise } = manager.startInBackground(workflow.script, args, {
+    parentSessionId,
     concurrency: settings.concurrency,
     maxAgents: settings.maxAgents,
     confirm: ctx.hasUI

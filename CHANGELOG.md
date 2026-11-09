@@ -4,6 +4,16 @@ All notable changes to this project are documented here. Release dates match the
 
 ## [Unreleased]
 
+## [0.5.6-pt.1] - 2026-11-09
+
+### Added
+- Added optional before-prompt workflow SDK child observation with actual session IDs, immutable run ancestry, metadata-only monitor discovery, and bounded observer cleanup. Preserved cached resume, retries, model and tool routing, and background results.
+- Added synthetic workflow/monitor integration against installed Pi 1.5.0 and compatibility prerelease validation in the changelog CLI.
+
+### Changed
+- Pinned Pi development packages to the validated 1.5.0 runtime. This maintained compatibility build retains the upstream MIT license and author attribution.
+
+
 ### Fixed
 - Fixed a `cwd-history` race that could crash `pi --mode rpc` and T3 Code with `pi acp` during session replacement (#62). Custom editor history now runs only in terminal mode. Pending history loads are invalidated on shutdown, and late failures no longer terminate Pi.
 - Fixed powerline footer extension statuses disappearing and truncating the clock. Status text now has reserved space or wraps onto separate lines when it cannot fit beside the model and clock (#60, reported by @sunbird89629).

@@ -27,6 +27,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { parse } from "acorn";
 import { Type } from "typebox";
+import { disposeChildLease, type AttachChild, type ChildLease } from "./child-observer.js";
 
 const MAX_CONCURRENCY = 16;
 const MAX_AGENTS = 1000;
@@ -143,10 +144,12 @@ interface WorkflowManagerOptions {
   runsDir?: string;
   loadSavedWorkflow?: (name: string) => string | undefined;
   defaultAgentRetries?: number;
+  childObserver?: AttachChild;
   agent?: (prompt: string, options: AgentCallOptions) => Promise<AgentRunResult>;
 }
 
 interface ExecOptions {
+  parentSessionId?: string;
   maxAgents?: number;
   concurrency?: number;
   tokenBudget?: number;
@@ -187,6 +190,7 @@ interface ExecuteOptions extends ExecOptions {
   resumeJournal?: JournalEntry[];
   loadSavedWorkflow?: (name: string) => string | undefined;
   agentRunner?: (prompt: string, options: AgentCallOptions) => Promise<AgentRunResult>;
+  childObserver?: AttachChild;
 }
 
 type ProviderRegistration = Parameters<ModelRuntime["registerProvider"]>[1];
@@ -209,6 +213,7 @@ export class WorkflowManager extends EventEmitter {
   private readonly loadSavedWorkflow?: (name: string) => string | undefined;
   private readonly defaultAgentRetries: number;
   private readonly agentRunner?: (prompt: string, options: AgentCallOptions) => Promise<AgentRunResult>;
+  private readonly childObserver?: AttachChild;
   private modelRegistry?: ModelRegistry;
   private modelRuntimePromise?: Promise<ModelRuntime>;
   private readonly registeredProviders = new Map<string, ProviderRegistration>();
@@ -222,6 +227,7 @@ export class WorkflowManager extends EventEmitter {
     this.defaultAgentRetries = options.defaultAgentRetries ?? 0;
     this.runsDir = options.runsDir ?? workflowRunsDir(this.cwd);
     this.agentRunner = options.agent;
+    this.childObserver = options.childObserver;
     mkdirSync(this.runsDir, { recursive: true });
     this.recoverInterruptedRuns();
   }
@@ -251,13 +257,13 @@ export class WorkflowManager extends EventEmitter {
     args?: unknown,
     options: ExecOptions = {},
   ): { runId: string; promise: Promise<WorkflowRunResult> } {
-    const run = this.createRun(script, args, true);
+    const run = this.createRun(script, args, true, options);
     const promise = this.execute(run, options);
     return { runId: run.runId, promise };
   }
 
   runSync(script: string, args?: unknown, options: ExecOptions = {}): Promise<WorkflowRunResult> {
-    return this.execute(this.createRun(script, args, false), options);
+    return this.execute(this.createRun(script, args, false, options), options);
   }
 
   pause(runId: string): boolean {
@@ -328,7 +334,7 @@ export class WorkflowManager extends EventEmitter {
     return true;
   }
 
-  private createRun(script: string, args: unknown, background: boolean): ManagedRun {
+  private createRun(script: string, args: unknown, background: boolean, options: ExecOptions): ManagedRun {
     const { meta } = parseWorkflowScript(script);
     const slug = meta.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 32);
     const runId = `${slug || "workflow"}-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
@@ -344,7 +350,7 @@ export class WorkflowManager extends EventEmitter {
       journal: [],
       startedAt: now,
       updatedAt: now,
-      sessionId: this.sessionId,
+      sessionId: "parentSessionId" in options ? options.parentSessionId : this.sessionId,
       ownerPid: process.pid,
       controller: new AbortController(),
       background,
@@ -357,11 +363,14 @@ export class WorkflowManager extends EventEmitter {
   private async execute(run: ManagedRun, options: ExecOptions): Promise<WorkflowRunResult> {
     const externalAbort = () => run.controller.abort(options.externalSignal?.reason);
     options.externalSignal?.addEventListener("abort", externalAbort, { once: true });
+    if (options.externalSignal?.aborted) externalAbort();
     try {
       const result = await executeWorkflow(run.script, run.args, {
         ...options,
         cwd: this.cwd,
         runId: run.runId,
+        parentSessionId: run.sessionId,
+        childObserver: this.childObserver,
         signal: run.controller.signal,
         modelRegistry: this.modelRegistry,
         modelRuntime: this.agentRunner ? undefined : await this.getModelRuntime(),
@@ -482,7 +491,15 @@ export class WorkflowManager extends EventEmitter {
   }
 }
 
-export function createWorkflowTool(options: { cwd?: string; manager: WorkflowManager }) {
+export function invocationSessionId(ctx: Pick<ExtensionContext, "sessionManager">): string | undefined {
+  try { return ctx.sessionManager.getSessionId(); } catch { return undefined; }
+}
+
+export function createWorkflowTool(options: {
+  cwd?: string;
+  manager: WorkflowManager;
+  beforeExecute?: (input: WorkflowToolInput, ctx: ExtensionContext) => Promise<WorkflowToolInput>;
+}) {
   const manager = options.manager;
   return defineTool({
     name: "workflow",
@@ -499,7 +516,9 @@ export function createWorkflowTool(options: { cwd?: string; manager: WorkflowMan
       "Runs are background by default. The completed result returns to the conversation automatically.",
     ],
     parameters: workflowToolSchema,
-    async execute(_toolCallId, params, signal, onUpdate, _ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const origin = ctx?.sessionManager ? { parentSessionId: invocationSessionId(ctx) } : {};
+      if (options.beforeExecute) params = await options.beforeExecute(params, ctx);
       if (params.resumeFromRunId) {
         const resumed = await manager.resume(params.resumeFromRunId);
         if (!resumed) throw new Error(`Workflow ${params.resumeFromRunId} is not resumable.`);
@@ -510,6 +529,7 @@ export function createWorkflowTool(options: { cwd?: string; manager: WorkflowMan
       }
       if (params.background ?? true) {
         const { runId, promise } = manager.startInBackground(params.script, params.args, {
+          ...origin,
           maxAgents: params.maxAgents,
           concurrency: params.concurrency,
           tokenBudget: params.tokenBudget,
@@ -527,6 +547,7 @@ export function createWorkflowTool(options: { cwd?: string; manager: WorkflowMan
         };
       }
       const result = await manager.runSync(params.script, params.args, {
+        ...origin,
         maxAgents: params.maxAgents,
         concurrency: params.concurrency,
         tokenBudget: params.tokenBudget,
@@ -736,7 +757,7 @@ async function executeWorkflow(script: string, args: unknown, options: ExecuteOp
         try {
           const result = options.agentRunner
             ? await options.agentRunner(prompt, callOptions)
-            : await runAgent(prompt, callOptions, options);
+            : await runAgent(prompt, callOptions, options, index);
           if (options.signal.aborted) throw abortError(options.signal.reason);
           row.status = "done";
           row.result = result.output;
@@ -875,7 +896,7 @@ async function executeWorkflow(script: string, args: unknown, options: ExecuteOp
   };
 }
 
-async function runAgent(prompt: string, options: AgentCallOptions, run: ExecuteOptions): Promise<AgentRunResult> {
+async function runAgent(prompt: string, options: AgentCallOptions, run: ExecuteOptions, callIndex: number): Promise<AgentRunResult> {
   const requested = options.model ?? (options.tier ? loadModelTierConfig().tiers[options.tier] : undefined) ?? run.mainModel;
   if (!requested) throw new Error("No model route was selected for this workflow agent.");
   const resolved = resolveModel(requested, run.modelRuntime);
@@ -904,7 +925,17 @@ async function runAgent(prompt: string, options: AgentCallOptions, run: ExecuteO
   });
   const abort = () => void session.abort();
   run.signal.addEventListener("abort", abort, { once: true });
+  let lease: ChildLease | undefined;
   try {
+    lease = await run.childObserver?.(session, Object.freeze({
+      version: 1,
+      producer: "workflow",
+      parentSessionId: run.parentSessionId,
+      runId: run.runId,
+      callId: String(callIndex),
+      attemptId: session.sessionId,
+    }));
+    if (run.signal.aborted) throw abortError(run.signal.reason);
     await session.prompt(prompt, { source: "extension" });
     const output = lastAssistantText(session.messages);
     if (!output) throw new Error("Subagent returned no text result.");
@@ -918,7 +949,7 @@ async function runAgent(prompt: string, options: AgentCallOptions, run: ExecuteO
     };
   } finally {
     run.signal.removeEventListener("abort", abort);
-    session.dispose();
+    try { await disposeChildLease(lease); } finally { session.dispose(); }
   }
 }
 
